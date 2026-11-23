@@ -16,6 +16,7 @@
 
 namespace da {
 class Engine;
+struct StreamCloud;
 
 struct StreamParams {
     int    chunk_size    = 12;        // frames per fused window (<= ~24)
@@ -41,6 +42,10 @@ struct StreamParams {
     int    loop_min_corr = 150;       // accept a loop only with >= this many ICP correspondences
     double loop_info    = 5.0;        // information weight of a loop edge vs a sequential edge (=1)
     PoseGraphParams pose_graph;       // optimizer params (used only when loop_close)
+    std::function<void(int done, int total)> on_progress; // optional live window progress callback
+    std::string checkpoint_path;      // optional binary checkpoint file to save/resume across restarts
+    int checkpoint_every = 20;        // save checkpoint & emit partial cloud every N windows
+    std::function<void(int done, int total, const StreamCloud& partial)> on_checkpoint;
 };
 
 struct StreamCloud {

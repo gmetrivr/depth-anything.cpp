@@ -19,6 +19,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 type manifestStep struct {
@@ -120,7 +122,7 @@ func (s *server) handleScenes(w http.ResponseWriter, r *http.Request) {
 		}
 		thumb := ""
 		if len(m.Steps[0].Images) > 0 {
-			thumb = "/scenes-assets/" + e.Name() + "/" + m.Steps[0].Images[0]
+			thumb = "scenes-assets/" + e.Name() + "/" + m.Steps[0].Images[0]
 		}
 		src := "baked"
 		if _, err := os.Stat(filepath.Join(s.scenesDir, e.Name(), ".uploaded")); err == nil {
@@ -132,7 +134,16 @@ func (s *server) handleScenes(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	writeJSON(w, map[string]any{"scenes": out})
+	activeJob := ""
+	s.jobsMu.Lock()
+	for id, j := range s.jobs {
+		if j != nil && j.State == "running" {
+			activeJob = id
+			break
+		}
+	}
+	s.jobsMu.Unlock()
+	writeJSON(w, map[string]any{"scenes": out, "active_job": activeJob})
 }
 
 func prettify(s string) string {
@@ -152,21 +163,31 @@ func (s *server) handleSceneStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, j)
 }
 
-// POST /api/scene/from-video  (multipart: video, name, model, mode, max_frames, conf_pct, point_size)
+// POST /api/scene/from-video  (multipart: video or video_path, name, model, mode, max_frames, conf_pct, point_size)
 func (s *server) handleSceneFromVideo(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(512 << 20); err != nil {
-		http.Error(w, "bad form: "+err.Error(), 400)
-		return
+	_ = r.ParseMultipartForm(512 << 20)
+	localPath := strings.TrimSpace(r.FormValue("video_path"))
+	var (
+		file io.ReadCloser
+		hdrName string
+	)
+	if localPath == "" {
+		f, hdr, err := r.FormFile("video")
+		if err != nil {
+			http.Error(w, "missing video", 400)
+			return
+		}
+		file = f
+		defer file.Close()
+		if hdr != nil {
+			hdrName = hdr.Filename
+		}
+	} else {
+		hdrName = filepath.Base(localPath)
 	}
-	file, hdr, err := r.FormFile("video")
-	if err != nil {
-		http.Error(w, "missing video", 400)
-		return
-	}
-	defer file.Close()
 	name := slug(r.FormValue("name"))
-	if name == "scene" && hdr != nil {
-		name = slug(strings.TrimSuffix(hdr.Filename, filepath.Ext(hdr.Filename)))
+	if name == "scene" && hdrName != "" {
+		name = slug(strings.TrimSuffix(hdrName, filepath.Ext(hdrName)))
 	}
 	model := r.FormValue("model")
 	if model == "" {
@@ -180,8 +201,8 @@ func (s *server) handleSceneFromVideo(w http.ResponseWriter, r *http.Request) {
 	if maxFrames < 2 {
 		maxFrames = 2
 	}
-	if maxFrames > 600 {
-		maxFrames = 600
+	if maxFrames > 100000 {
+		maxFrames = 100000
 	}
 	chunkSize := atoiDefault(r.FormValue("chunk_size"), 12)
 	if chunkSize < 2 {
@@ -201,8 +222,8 @@ func (s *server) handleSceneFromVideo(w http.ResponseWriter, r *http.Request) {
 	// fps<=0 (the default) => auto: bakeVideo picks an fps so the whole clip yields
 	// ~maxFrames frames. An explicit value overrides (clamped to a sane range).
 	fps := atofDefault(r.FormValue("fps"), 0)
-	if fps > 0 && fps < 0.5 {
-		fps = 0.5
+	if fps > 0 && fps < 0.05 {
+		fps = 0.05
 	}
 	if fps > 30 {
 		fps = 30
@@ -222,22 +243,26 @@ func (s *server) handleSceneFromVideo(w http.ResponseWriter, r *http.Request) {
 	surfels := boolForm(r.FormValue("surfels"))                     // orient points as flat surface disks
 	voxelRes := atofDefault(r.FormValue("voxel_res"), 100)          // cells across the bbox diagonal (mode=voxels)
 	temporalMesh := boolForm(r.FormValue("temporal_mesh"))          // precomputed exposed-face playback mesh
+	device := r.FormValue("device")                                 // "gpu" or "cpu"
 
-	// save upload
+	// save upload (or use local file path directly)
 	jobDir := filepath.Join(s.workDir, "uploads", name)
 	_ = os.MkdirAll(jobDir, 0o755)
-	vpath := filepath.Join(jobDir, "input"+filepath.Ext(hdr.Filename))
-	out, err := os.Create(vpath)
-	if err != nil {
-		http.Error(w, err.Error(), 500)
-		return
-	}
-	if _, err := io.Copy(out, file); err != nil {
+	vpath := localPath
+	if vpath == "" {
+		vpath = filepath.Join(jobDir, "input"+filepath.Ext(hdrName))
+		out, err := os.Create(vpath)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		if _, err := io.Copy(out, file); err != nil {
+			out.Close()
+			http.Error(w, err.Error(), 500)
+			return
+		}
 		out.Close()
-		http.Error(w, err.Error(), 500)
-		return
 	}
-	out.Close()
 
 	s.jobsMu.Lock()
 	s.jobs[name] = &sceneJob{State: "running"}
@@ -246,7 +271,7 @@ func (s *server) handleSceneFromVideo(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		s.bakeSem <- struct{}{}
 		defer func() { <-s.bakeSem }()
-		err := s.bakeVideo(name, vpath, jobDir, model, mode, maxFrames, chunkSize, overlap, fps, confPct, ptSize,
+		err := s.bakeVideo(name, vpath, jobDir, model, mode, device, maxFrames, chunkSize, overlap, fps, confPct, ptSize,
 			icpRefine, loopClose, fuse, metric, temporalMesh, fuseVoxel, fuseVoxelFrac, fuseTruncMult, nearBias, surfels, voxelRes)
 		s.jobsMu.Lock()
 		j := s.jobs[name]
@@ -262,36 +287,54 @@ func (s *server) handleSceneFromVideo(w http.ResponseWriter, r *http.Request) {
 }
 
 // bakeVideo: ffmpeg -> frames -> DA3 -> acc_*.splat + thumbnails + manifest.
-func (s *server) bakeVideo(name, vpath, jobDir, model, mode string, maxFrames, chunkSize, overlap int, fps, confPct float64, ptSize float32,
+func (s *server) bakeVideo(name, vpath, jobDir, model, mode, device string, maxFrames, chunkSize, overlap int, fps, confPct float64, ptSize float32,
 	icpRefine, loopClose, fuse, metric, temporalMesh bool, fuseVoxel, fuseVoxelFrac, fuseTruncMult, nearBias float64, surfels bool, voxelRes float64) error {
+	sceneDir := filepath.Join(s.scenesDir, name)
+	_ = os.MkdirAll(sceneDir, 0o755)
+	_ = os.WriteFile(filepath.Join(sceneDir, ".uploaded"), []byte("1"), 0o644)
+
 	framesDir := filepath.Join(jobDir, "frames")
-	_ = os.RemoveAll(framesDir)
-	_ = os.MkdirAll(framesDir, 0o755)
-	// Auto fps: pick a rate so the WHOLE clip yields ~maxFrames frames. A fixed low
-	// fps starves short clips (a 0.5s clip at 6fps gives 3 frames -> sparse cloud),
-	// so when no explicit fps is set, derive it from the probed duration.
-	if fps <= 0 {
-		fps = 6 // fallback if the probe fails
-		if dur := probeDurationSec(vpath); dur > 0.05 {
-			fps = float64(maxFrames) / dur
-			if fps < 1 {
-				fps = 1
-			}
-			if fps > 30 {
-				fps = 30
+	var all []string
+	// Fast resume: if sceneDir already holds pre-extracted view_*.jpg frames, reuse them directly!
+	if existingViews, _ := filepath.Glob(filepath.Join(sceneDir, "view_*.jpg")); len(existingViews) >= 2 {
+		sort.Slice(existingViews, func(i, j int) bool {
+			bi := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(existingViews[i]), "view_"), ".jpg")
+			bj := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(existingViews[j]), "view_"), ".jpg")
+			vi, _ := strconv.Atoi(bi)
+			vj, _ := strconv.Atoi(bj)
+			return vi < vj
+		})
+		all = existingViews
+		log.Printf("scene %s: reusing %d existing view_*.jpg frames in %s", name, len(all), sceneDir)
+	} else {
+		_ = os.RemoveAll(framesDir)
+		_ = os.MkdirAll(framesDir, 0o755)
+		// Auto fps: pick a rate so the WHOLE clip yields ~maxFrames frames. A fixed low
+		// fps starves short clips (a 0.5s clip at 6fps gives 3 frames -> sparse cloud),
+		// so when no explicit fps is set, derive it from the probed duration.
+		if fps <= 0 {
+			fps = 6 // fallback if the probe fails
+			if dur := probeDurationSec(vpath); dur > 0.05 {
+				fps = float64(maxFrames) / dur
+				if fps < 0.05 {
+					fps = 0.05
+				}
+				if fps > 30 {
+					fps = 30
+				}
 			}
 		}
-	}
-	// Bounded extraction (fps cap + downscale), then even stride to maxFrames.
-	cmd := exec.Command("ffmpeg", "-y", "-loglevel", "error", "-i", vpath,
-		"-vf", fmt.Sprintf("fps=%g,scale=640:-2", fps), filepath.Join(framesDir, "all%05d.jpg"))
-	if b, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("ffmpeg: %v: %s", err, string(b))
-	}
-	all, _ := filepath.Glob(filepath.Join(framesDir, "all*.jpg"))
-	sort.Strings(all)
-	if len(all) < 2 {
-		return fmt.Errorf("video produced %d frames (need >=2)", len(all))
+		// Bounded extraction (fps cap + downscale), then even stride to maxFrames.
+		cmd := exec.Command("ffmpeg", "-y", "-loglevel", "error", "-threads", "12", "-i", vpath,
+			"-vf", fmt.Sprintf("fps=%g,scale=640:-2", fps), filepath.Join(framesDir, "all%05d.jpg"))
+		if b, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("ffmpeg: %v: %s", err, string(b))
+		}
+		all, _ = filepath.Glob(filepath.Join(framesDir, "all*.jpg"))
+		sort.Strings(all)
+		if len(all) < 2 {
+			return fmt.Errorf("video produced %d frames (need >=2)", len(all))
+		}
 	}
 	stride := (len(all) + maxFrames - 1) / maxFrames
 	if stride < 1 {
@@ -301,11 +344,6 @@ func (s *server) bakeVideo(name, vpath, jobDir, model, mode string, maxFrames, c
 	for i := 0; i < len(all) && len(sel) < maxFrames; i += stride {
 		sel = append(sel, all[i])
 	}
-
-	sceneDir := filepath.Join(s.scenesDir, name)
-	_ = os.RemoveAll(sceneDir)
-	_ = os.MkdirAll(sceneDir, 0o755)
-	_ = os.WriteFile(filepath.Join(sceneDir, ".uploaded"), []byte("1"), 0o644)
 
 	s.setJob(name, func(j *sceneJob) { j.Total = len(sel) })
 
@@ -330,7 +368,7 @@ func (s *server) bakeVideo(name, vpath, jobDir, model, mode string, maxFrames, c
 		var splat []byte
 		var cam *Cam
 		err := s.infer(func() error {
-			return s.reg.WithModel(model, func(ctx uintptr, _ *ModelInfo) error {
+			return s.reg.WithModelOnDevice(model, device, func(ctx uintptr, _ *ModelInfo) error {
 				g, e := s.api.Gaussians(ctx, g224)
 				if e != nil {
 					return e
@@ -355,16 +393,65 @@ func (s *server) bakeVideo(name, vpath, jobDir, model, mode string, maxFrames, c
 	if !mi.Pose {
 		return fmt.Errorf("model %q has no camera pose; cannot fuse frames", model)
 	}
-	// thumbnails first (so progress feels live)
+	// thumbnails first (so progress feels live). For large frame sets (>120), hardlink
+	// the already-640px extracted JPEGs directly instead of spawning thousands of ffmpeg processes.
 	thumbs := make([]string, len(sel))
-	for i, f := range sel {
-		thumbs[i] = fmt.Sprintf("view_%d.jpg", i)
-		_ = copyScaled(f, filepath.Join(sceneDir, thumbs[i]), 360)
+	if len(sel) > 120 {
+		for i, f := range sel {
+			thumbs[i] = fmt.Sprintf("view_%d.jpg", i)
+			dst := filepath.Join(sceneDir, thumbs[i])
+			if f == dst {
+				continue
+			}
+			if os.Link(f, dst) != nil {
+				_ = copyScaled(f, dst, 360)
+			}
+		}
+	} else {
+		sem := make(chan struct{}, 12)
+		var wg sync.WaitGroup
+		for i, f := range sel {
+			thumbs[i] = fmt.Sprintf("view_%d.jpg", i)
+			wg.Add(1)
+			go func(idx int, src string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				_ = copyScaled(src, filepath.Join(sceneDir, thumbs[idx]), 360)
+			}(i, f)
+		}
+		wg.Wait()
 	}
 
 	var cloud *Cloud
 	err := s.infer(func() error {
-		return s.reg.WithModel(model, func(ctx uintptr, _ *ModelInfo) error {
+		return s.reg.WithModelOnDevice(model, device, func(ctx uintptr, _ *ModelInfo) error {
+			s.api.SetCheckpointPath(ctx, filepath.Join(sceneDir, ".stream_ckpt.bin"))
+			stopProg := make(chan struct{})
+			defer close(stopProg)
+			go func() {
+				t := time.NewTicker(1 * time.Second)
+				defer t.Stop()
+				lastSeq := 0
+				for {
+					select {
+					case <-stopProg:
+						return
+					case <-t.C:
+						d := int(s.api.streamProgress(ctx))
+						if d > 0 {
+							s.setJob(name, func(j *sceneJob) { j.Done = d; j.Kept = d })
+						}
+						if pCloud, seq, pDone := s.api.PollCheckpoint(ctx, lastSeq); pCloud != nil {
+							lastSeq = seq
+							_ = s.writeSceneOutput(name, sceneDir, model, mode, thumbs[:pDone], pCloud,
+								fuse, fuseVoxelFrac, nearBias, false, voxelRes)
+							log.Printf("scene %s: saved live checkpoint #%d (%d/%d frames, %d pts)",
+								name, seq, pDone, len(sel), pCloud.N)
+						}
+					}
+				}
+			}()
 			// Metric output only makes sense for a nested (metric-capable) model; the
 			// C side would reject metric on a plain pose model, so gate it here.
 			c, e := s.api.PointsStream(ctx, sel, chunkSize, overlap, confPct, ptSize, s.maxSplats,
@@ -381,6 +468,11 @@ func (s *server) bakeVideo(name, vpath, jobDir, model, mode string, maxFrames, c
 		return err
 	}
 	s.setJob(name, func(j *sceneJob) { j.Done = len(sel); j.Kept = len(sel) })
+	return s.writeSceneOutput(name, sceneDir, model, mode, thumbs, cloud, fuse, fuseVoxelFrac, nearBias, surfels, voxelRes)
+}
+
+func (s *server) writeSceneOutput(name, sceneDir, model, mode string, thumbs []string, cloud *Cloud,
+	fuse bool, fuseVoxelFrac, nearBias float64, surfels bool, voxelRes float64) error {
 
 	// Depth-weighted density: keep more near-camera points, fewer far ones. Applied
 	// once here so the build-up below (which slices Counts prefixes) sees the thinned
@@ -445,7 +537,11 @@ func (s *server) bakeVideo(name, vpath, jobDir, model, mode string, maxFrames, c
 		fullBlob = pointsToSplat(cloud, cloud.N, 1.0)
 	}
 	const fullName = "acc_full.splat"
-	if e := os.WriteFile(filepath.Join(sceneDir, fullName), fullBlob, 0o644); e != nil {
+	tmpSplat := filepath.Join(sceneDir, fullName+".tmp")
+	if e := os.WriteFile(tmpSplat, fullBlob, 0o644); e != nil {
+		return e
+	}
+	if e := os.Rename(tmpSplat, filepath.Join(sceneDir, fullName)); e != nil {
 		return e
 	}
 	var temporalManifest *temporalMeshManifest
@@ -464,7 +560,7 @@ func (s *server) bakeVideo(name, vpath, jobDir, model, mode string, maxFrames, c
 
 	steps := []manifestStep{}
 	prefix := 0
-	nv := cloud.N0(len(sel))
+	nv := cloud.N0(len(thumbs))
 	bstep := (nv + 29) / 30
 	if bstep < 1 {
 		bstep = 1
@@ -493,14 +589,18 @@ func (s *server) bakeVideo(name, vpath, jobDir, model, mode string, maxFrames, c
 				label = fmt.Sprintf("full %d-view cloud · %d pts", k, totalPrims)
 			}
 		}
-		steps = append(steps, manifestStep{Splat: fullName, Images: thumbs[:k], N: k, NPts: npts, Label: label})
+		stepImgs := thumbs[:k]
+		if len(thumbs) > 120 {
+			stepImgs = thumbs[:1]
+		}
+		steps = append(steps, manifestStep{Splat: fullName, Images: stepImgs, N: k, NPts: npts, Label: label})
 	}
 
 	// Per-frame capture poses for the viewer flythrough: flip OpenCV(y-down,z-fwd) ->
 	// GL(y-up) to match the rendered cloud (the splat encoder applies the same flip to
 	// point positions). Failed-window frames come back as zero; forward/back-fill them
 	// from the nearest valid pose so the camera path stays continuous.
-	fpos, ffwd := frameGLPoses(cloud, len(sel))
+	fpos, ffwd := frameGLPoses(cloud, len(thumbs))
 	return writeManifest(sceneDir, sceneManifest{Model: model, Mode: mode, Steps: steps,
 		FramePos: fpos, FrameFwd: ffwd, TemporalMesh: temporalManifest})
 }
@@ -574,7 +674,11 @@ func (c *Cloud) N0(nViews int) int {
 
 func writeManifest(dir string, m sceneManifest) error {
 	b, _ := json.MarshalIndent(m, "", "  ")
-	return os.WriteFile(filepath.Join(dir, "manifest.json"), b, 0o644)
+	tmp := filepath.Join(dir, "manifest.json.tmp")
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(dir, "manifest.json"))
 }
 
 func copyScaled(src, dst string, px int) error {

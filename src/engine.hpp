@@ -27,6 +27,8 @@ public:
     static std::unique_ptr<Engine> load_nested(const std::string& anyview_gguf,
                                                const std::string& metric_gguf, int n_threads);
     const Config& config() const { return ml_.config(); }
+    const std::string& device_name() const { return be_.device_name(); }
+    bool is_offloading() const { return be_.is_offloading(); }
     // True iff this engine was created via load_nested() (anyview + metric
     // branches both loaded). depth_metric() is then the valid inference path.
     bool is_nested() const { return metric_ml_ != nullptr; }

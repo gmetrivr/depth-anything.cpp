@@ -10,7 +10,8 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>depth-anything.cpp — DA3 studio</title>
+<title>dg2n store scan</title>
+<link rel="icon" href="favicon.ico" sizes="any"/>
 <style>
   :root { color-scheme: dark; }
   * { margin: 0; box-sizing: border-box; }
@@ -29,7 +30,9 @@
     border: 1px solid rgba(255,255,255,.08); border-radius: 14px; padding: 14px 16px;
     font-size: 13px; line-height: 1.45; box-shadow: 0 8px 30px rgba(0,0,0,.45);
   }
-  h1 { font-size: 14px; font-weight: 650; letter-spacing: .2px; }
+  .brand { display: flex; align-items: center; gap: 10px; }
+  .brand img { width: 28px; height: 28px; border-radius: 6px; display: block; flex-shrink: 0; }
+  h1 { font-size: 15px; font-weight: 650; letter-spacing: .2px; }
   .sub { color: #8b93a1; font-size: 11.5px; margin-top: 2px; }
   .tabs { display: flex; gap: 6px; margin: 12px 0 10px; }
   .tab { flex: 1; text-align: center; padding: 7px 0; border-radius: 8px; cursor: pointer; font-size: 12.5px;
@@ -80,8 +83,10 @@
 <canvas id="gl"></canvas>
 <div id="pip" class="hide"><img id="pipimg" alt=""/><div class="cap" id="pipcap">source</div></div>
 <div id="panel">
-  <h1>depth-anything.cpp · DA3 studio</h1>
-  <div class="sub">video → coherent point cloud / gaussians, in the browser</div>
+  <div class="brand">
+    <img src="dg2n-logo-wt.png" alt="dg2n"/>
+    <h1>dg2n store scan</h1>
+  </div>
 
   <div class="tabs">
     <div class="tab active" data-tab="scenes">Scenes</div>
@@ -105,6 +110,12 @@
 
   <!-- CREATE -->
   <div id="tab-create" class="hide">
+    <label class="fld">Compute</label>
+    <div class="seg" id="devseg">
+      <button data-dev="gpu" class="on">GPU (Auto)</button>
+      <button data-dev="cpu">CPU</button>
+    </div>
+
     <label class="fld">Model</label>
     <select id="model"></select>
     <div class="chips" id="modelchips"></div>
@@ -152,9 +163,9 @@
     </div>
 
     <div class="row hide" id="fuseparams">
-      <div title="Surface fusion (A) voxel edge, as a fraction of the scene size. Smaller = finer surface and more points, but a narrower merge band. Default 0.40%.">
-        <label class="fld">Fuse voxel <span id="fusedetailval">0.40%</span></label>
-        <input type="range" id="fusedetail" style="width:100%" min="0.0015" max="0.012" step="0.0005" value="0.004"/></div>
+      <div title="Surface fusion (A) voxel edge, as a fraction of the scene size. Smaller = finer surface and more points, but a narrower merge band. Default 0.12%.">
+        <label class="fld">Fuse voxel <span id="fusedetailval">0.12%</span></label>
+        <input type="range" id="fusedetail" style="width:100%" min="0.0005" max="0.012" step="0.0005" value="0.0012"/></div>
       <div title="How far apart two doubled surfaces still merge, as a multiple of the voxel (max merged gap = 2×). Higher removes more ghosting/drift but can fuse genuinely-separate surfaces. Default 4.">
         <label class="fld">Merge range <span id="fusetruncval">4× voxel</span></label>
         <input type="range" id="fusetrunc" style="width:100%" min="2" max="10" step="1" value="4"/></div>
@@ -167,6 +178,7 @@
   </div>
 
   <div id="bar"><div></div></div>
+  <div class="stat"><span>compute</span><span id="s-device">GPU</span></div>
   <div class="stat"><span>loaded</span><span id="s-loaded">0%</span></div>
   <div class="stat"><span>splats</span><span id="s-splats">0</span></div>
   <div class="stat"><span>fps</span><span id="s-fps">—</span></div>
@@ -177,6 +189,7 @@
 <script type="module">
 const $ = (id) => document.getElementById(id);
 const setStatus = (t, err=false) => { const s=$("status"); s.textContent=t; s.classList.toggle("err",err); };
+const BASE = location.pathname.endsWith("/") ? location.pathname : location.pathname + "/";
 const ROW = 32;
 
 /* ============================ WebGL viewer core ============================ */
@@ -456,7 +469,7 @@ let pipFrame=-1;
 function showPip(fi){ const F=nFrames(); if(F<1||!curScene) return;
   fi=Math.max(0,Math.min(F-1,fi));
   if(fi!==pipFrame){ pipFrame=fi;
-    $("pipimg").src=`/scenes-assets/${curScene}/view_${fi}.jpg?v=${curBust}`;
+    $("pipimg").src=`${BASE}scenes-assets/${curScene}/view_${fi}.jpg?v=${curBust}`;
     $("pipcap").textContent=`source · frame ${fi+1}/${F}`; }
   $("pip").classList.remove("hide");
 }
@@ -628,10 +641,30 @@ document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
   $("tab-create").classList.toggle("hide",t.dataset.tab!=="create");
 });
 
-// ---- models ----
-let MODELS=[], curModel=null;
+// ---- models & compute device ----
+let MODELS=[], curModel=null, curDevice="gpu";
+function updateDeviceBadge(r){
+  if(!r) return;
+  if(r.device) curDevice=r.device;
+  document.querySelectorAll('#devseg button').forEach(b=>b.classList.toggle("on",b.dataset.dev===curDevice));
+  const act=r.active_device||curDevice;
+  $("s-device").textContent = r.gpu ? `GPU · ${act}` : `CPU (${act})`;
+}
+async function setDevice(dev){
+  curDevice=dev;
+  document.querySelectorAll('#devseg button').forEach(b=>b.classList.toggle("on",b.dataset.dev===dev));
+  $("s-device").textContent = dev==="gpu" ? "switching to GPU…" : "switching to CPU…";
+  try{
+    const fd=new FormData(); fd.append("device",dev); if(curModel) fd.append("model",curModel.name);
+    const r=await (await fetch(BASE+"api/device",{method:"POST",body:fd})).json();
+    updateDeviceBadge(r);
+  }catch(e){ setStatus("device: "+e.message,true); }
+}
+document.querySelectorAll('#devseg button').forEach(b=>b.onclick=()=>setDevice(b.dataset.dev));
+
 async function loadModels(){
-  const r=await (await fetch("/api/models")).json(); MODELS=r.models||[];
+  const r=await (await fetch(BASE+"api/models")).json(); MODELS=r.models||[];
+  updateDeviceBadge(r);
   const sel=$("model"); sel.innerHTML="";
   for(const m of MODELS){ const o=document.createElement("option"); o.value=m.name; o.textContent=m.label; if(m.name===r.default) o.selected=true; sel.appendChild(o); }
   sel.onchange=()=>pickModel(sel.value); pickModel(sel.value||(MODELS[0]&&MODELS[0].name));
@@ -705,7 +738,7 @@ $("gen").onclick=async()=>{
   try{
     if(src==="video"){
       const fd=new FormData(); fd.append("video",chosen[0]); fd.append("name",chosen[0].name.replace(/\.[^.]+$/,""));
-      fd.append("model",curModel.name); fd.append("mode",mode);
+      fd.append("model",curModel.name); fd.append("mode",mode); fd.append("device",curDevice);
       fd.append("max_frames",$("maxframes").value); fd.append("conf_pct",$("confpct").value);
       fd.append("chunk_size",$("chunk").value); fd.append("overlap",$("overlap").value);
       fd.append("icp_refine",$("icprefine").checked?"1":"0");
@@ -719,28 +752,33 @@ $("gen").onclick=async()=>{
       fd.append("surfels",$("surfels").checked?"1":"0");
       fd.append("voxel_res",$("voxelres").value);
       setStatus("uploading video…");
-      const r=await (await fetch("/api/scene/from-video",{method:"POST",body:fd})).json();
+      const r=await (await fetch(BASE+"api/scene/from-video",{method:"POST",body:fd})).json();
       if(r.error){ throw new Error(r.error); }
       await pollScene(r.job);
     } else {
       const fd=new FormData(); for(const f of chosen) fd.append("images",f);
-      fd.append("model",curModel.name); fd.append("mode",mode); fd.append("conf_pct",$("confpct").value);
+      fd.append("model",curModel.name); fd.append("mode",mode); fd.append("device",curDevice); fd.append("conf_pct",$("confpct").value);
       setStatus(`running ${mode}…`);
-      const resp=await fetch("/api/reconstruct",{method:"POST",body:fd});
+      const resp=await fetch(BASE+"api/reconstruct",{method:"POST",body:fd});
       if(!resp.ok) throw new Error(await resp.text());
       const r=await resp.json();
       setStatus(`done · ${r.n.toLocaleString()} splats · ${r.seconds.toFixed(1)}s`);
       curMode=mode; gsCam=r.cam||null;
-      await loadSplat("/api/splat/"+r.id);
+      await loadSplat(BASE+"api/splat/"+r.id);
     }
   }catch(err){ setStatus(err.message,true); }
   $("gen").disabled=false;
 };
 async function pollScene(job){
+  let lastCkpt=0;
   for(;;){
-    await new Promise(r=>setTimeout(r,1200));
-    const j=await (await fetch("/api/scene/status/"+encodeURIComponent(job))).json();
-    if(j.state==="running"){ setStatus(`baking… ${j.done}/${j.total||"?"} frames`); continue; }
+    await new Promise(r=>setTimeout(r,1500));
+    const j=await (await fetch(BASE+"api/scene/status/"+encodeURIComponent(job))).json();
+    if(j.state==="running"){
+      setStatus(`baking… ${j.done}/${j.total||"?"} frames`);
+      if(j.done && j.done-lastCkpt>=180){ lastCkpt=j.done; await loadScenes(); }
+      continue;
+    }
     if(j.state==="error"){ throw new Error(j.error||"bake failed"); }
     setStatus("scene ready"); await loadScenes(); document.querySelector(".tab[data-tab='scenes']").click(); openScene(j.scene); return;
   }
@@ -749,12 +787,13 @@ async function pollScene(job){
 // ---- scenes gallery + build-up playback ----
 let SCENES=[], curScene=null, steps=[], stepI=0, playTimer=null, curBust=0;
 async function loadScenes(){
-  const r=await (await fetch("/api/scenes")).json(); SCENES=r.scenes||[];
+  const r=await (await fetch(BASE+"api/scenes")).json(); SCENES=r.scenes||[];
   const g=$("gallery"); g.innerHTML="";
-  if(!SCENES.length){ g.innerHTML='<div class="sub" style="grid-column:1/3">No scenes yet — create one →</div>'; return; }
+  if(!SCENES.length){ g.innerHTML='<div class="sub" style="grid-column:1/3">No scenes yet — create one →</div>'; }
   for(const sc of SCENES){ const card=document.createElement("div"); card.className="card"; card.dataset.name=sc.name;
-    card.innerHTML=`<img src="${sc.thumb||""}" onerror="this.style.opacity=.2"/><div class="cap">${sc.label}<br><small>${sc.mode||"points"} · ${sc.steps} steps</small></div>`;
+    card.innerHTML=`<img src="${sc.thumb?BASE+sc.thumb:""}" onerror="this.style.opacity=.2"/><div class="cap">${sc.label}<br><small>${sc.mode||"points"} · ${sc.steps} steps</small></div>`;
     card.onclick=()=>openScene(sc.name); g.appendChild(card); }
+  return r.active_job||"";
 }
 async function openScene(name){
   curScene=name; curBust=Date.now();   // per-open cache-bust: a re-baked scene reuses
@@ -762,7 +801,7 @@ async function openScene(name){
   clearTemporalMesh(); temporalMeshView=true;
   hidePip();                            // reset the source-frame PiP for the new scene
   document.querySelectorAll(".card").forEach(c=>c.classList.toggle("active",c.dataset.name===name));
-  const m=await (await fetch(`/scenes-assets/${name}/manifest.json?v=${curBust}`)).json();
+  const m=await (await fetch(`${BASE}scenes-assets/${name}/manifest.json?v=${curBust}`)).json();
   curMode=m.mode||"points"; gsCam=m.cam||null;
   // Per-frame capture poses enable the flythrough; a scene baked before this feature (or
   // a gaussian scene) has none, so the camera button is disabled and we stay in orbit.
@@ -776,14 +815,14 @@ async function openScene(name){
   // read as "the scene reset to sparse and rebuilt"). Press ▶ to watch the build-up.
   stepI=steps.length-1; $("steprange").value=stepI; distLock=false;
   const meshPromise=(curMode==="voxels"&&m.temporal_mesh&&m.temporal_mesh.file)
-    ?loadTemporalMesh(`/scenes-assets/${name}/${m.temporal_mesh.file}?v=${curBust}`).catch(e=>{console.error(e);setStatus("mesh: "+e.message,true);})
+    ?loadTemporalMesh(`${BASE}scenes-assets/${name}/${m.temporal_mesh.file}?v=${curBust}`).catch(e=>{console.error(e);setStatus("mesh: "+e.message,true);})
     :Promise.resolve();
   await showStep(stepI,true); await meshPromise;
   if(temporalMeshReady)setTemporalFrame((steps[stepI].n|0)-1);
 }
 async function showStep(i,reframe){ stepI=i; $("steprange").value=i; const st=steps[i];
   $("stepnum").textContent=`${st.n}`;   // just the frame number; keeps the row short + stable
-  const url=`/scenes-assets/${curScene}/${st.splat}?v=${curBust}`;
+  const url=`${BASE}scenes-assets/${curScene}/${st.splat}?v=${curBust}`;
   if(url!==curSplatURL){
     // New scenes share ONE cloud file across all steps -> load once, then only the reveal
     // moves. Legacy scenes have a file per step -> this still loads each, revealing all.
@@ -817,7 +856,7 @@ function stopPlay(){ if(playTimer){ clearTimeout(playTimer); playTimer=null; } $
 // init
 setSrc("video"); setMode("points");
 loadModels().catch(e=>setStatus("models: "+e.message,true));
-loadScenes().then(()=>{ if(SCENES.length) openScene(SCENES[0].name); }).catch(()=>{});
+loadScenes().then((job)=>{ if(SCENES.length) openScene(SCENES[0].name); if(job) pollScene(job); }).catch(()=>{});
 </script>
 </body>
 </html>

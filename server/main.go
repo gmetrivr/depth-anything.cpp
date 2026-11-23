@@ -55,11 +55,23 @@ func main() {
 	lib := flag.String("lib", "../build/libdepthanything.so", "path to libdepthanything.so")
 	modelsDir := flag.String("models-dir", "../models", "directory with the .gguf weights")
 	scenesDir := flag.String("scenes-dir", "../.cache/da3-scenes", "directory of baked/uploaded scenes")
-	workDir := flag.String("work-dir", "/tmp/da3-demo", "scratch dir for uploads/frames")
+	workDir := flag.String("work-dir", "../.cache/da3-work", "scratch dir for uploads/frames")
 	threads := flag.Int("threads", 12, "inference threads")
 	maxLive := flag.Int("max-live", 1, "max resident model contexts (LRU evicted)")
 	maxSplats := flag.Int("max-splats", 3500000, "cap splats per output")
+	device := flag.String("device", "gpu", "preferred compute device: gpu (auto-pick discrete GPU) or cpu")
 	flag.Parse()
+
+	// Ensure NVIDIA Vulkan ICD is preferred over Mesa llvmpipe when VK_ICD_FILENAMES is unset.
+	if os.Getenv("VK_ICD_FILENAMES") == "" {
+		const nvICD = "/usr/share/vulkan/icd.d/nvidia_icd.json"
+		if _, err := os.Stat(nvICD); err == nil {
+			_ = os.Setenv("VK_ICD_FILENAMES", nvICD)
+		}
+	}
+	if os.Getenv("DA_FAST_MV") == "" {
+		_ = os.Setenv("DA_FAST_MV", "1")
+	}
 
 	api, err := openCAPI(*lib)
 	if err != nil {
@@ -72,7 +84,7 @@ func main() {
 
 	s := &server{
 		api:       api,
-		reg:       NewRegistry(api, *modelsDir, *threads, *maxLive),
+		reg:       NewRegistry(api, *modelsDir, *threads, *maxLive, *device),
 		scenesDir: *scenesDir,
 		workDir:   *workDir,
 		maxSplats: *maxSplats,
@@ -86,14 +98,21 @@ func main() {
 		log.Printf("WARNING: no models found in %s — run scripts/fetch_models.sh", *modelsDir)
 	} else {
 		names := make([]string, len(avail))
+		def := avail[0].Name
 		for i, m := range avail {
 			names[i] = m.Name
+			if m.Default {
+				def = m.Name
+			}
 		}
 		log.Printf("models available: %v", names)
+		// Warm-load the default model on startup so the active GPU/CPU device is verified immediately.
+		_ = s.reg.WithModel(def, func(_ uintptr, _ *ModelInfo) error { return nil })
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/models", s.handleModels)
+	mux.HandleFunc("/api/device", s.handleDevice)
 	mux.HandleFunc("/api/reconstruct", s.handleReconstruct)
 	mux.HandleFunc("/api/splat/", s.handleSplat)
 	mux.HandleFunc("/api/scenes", s.handleScenes)
@@ -135,7 +154,37 @@ func (s *server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if def == "" && len(avail) > 0 {
 		def = avail[0].Name
 	}
-	writeJSON(w, map[string]any{"models": avail, "default": def})
+	pref, activeDev, gpu := s.reg.DeviceStatus()
+	writeJSON(w, map[string]any{
+		"models": avail, "default": def,
+		"device": pref, "active_device": activeDev, "gpu": gpu,
+	})
+}
+
+// POST /api/device (form or query: device=gpu|cpu, model=optional)
+func (s *server) handleDevice(w http.ResponseWriter, r *http.Request) {
+	dev := r.FormValue("device")
+	model := r.FormValue("model")
+	if model == "" {
+		avail := s.reg.available()
+		for _, m := range avail {
+			if m.Default {
+				model = m.Name
+			}
+		}
+		if model == "" && len(avail) > 0 {
+			model = avail[0].Name
+		}
+	}
+	_ = s.infer(func() error {
+		s.reg.SetDevice(dev)
+		if model != "" {
+			return s.reg.WithModel(model, func(_ uintptr, _ *ModelInfo) error { return nil })
+		}
+		return nil
+	})
+	pref, activeDev, gpu := s.reg.DeviceStatus()
+	writeJSON(w, map[string]any{"device": pref, "active_device": activeDev, "gpu": gpu})
 }
 
 // GET /api/splat/{id}
@@ -184,6 +233,7 @@ func (s *server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	}
 	confPct := atofDefault(r.FormValue("conf_pct"), 55)
 	ptSize := float32(atofDefault(r.FormValue("point_size"), 1.2))
+	device := r.FormValue("device")
 
 	files := r.MultipartForm.File["images"]
 	if len(files) == 0 {
@@ -217,7 +267,7 @@ func (s *server) handleReconstruct(w http.ResponseWriter, r *http.Request) {
 	var nOut int
 	var cam *Cam
 	err := s.infer(func() error {
-		return s.reg.WithModel(model, func(ctx uintptr, mi *ModelInfo) error {
+		return s.reg.WithModelOnDevice(model, device, func(ctx uintptr, mi *ModelInfo) error {
 			if mode == "gaussians" {
 				if !mi.Gaussians {
 					return fmt.Errorf("model %q has no gaussian head (use da3-giant)", model)

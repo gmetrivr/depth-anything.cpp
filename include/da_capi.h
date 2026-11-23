@@ -31,6 +31,12 @@ void        da_capi_set_fuse_params(da_ctx* ctx, double voxel_frac, double trunc
    The mesh retains exact TSDF integer voxel keys and face lifetimes derived from
    each voxel's first-observing frame. Disabled by default. */
 void        da_capi_set_temporal_voxel_mesh(da_ctx* ctx, int enabled);
+int         da_capi_stream_progress(da_ctx* ctx);
+void        da_capi_set_checkpoint_path(da_ctx* ctx, const char* path);
+int         da_capi_stream_poll_checkpoint(da_ctx* ctx, int last_seq, int* out_seq, int* out_done,
+                                           int* out_n, int* out_nframes, int** out_counts,
+                                           float** out_xyz, unsigned char** out_rgb, float** out_rad,
+                                           float** out_pos, float** out_fwd);
 da_ctx*     da_capi_load(const char* gguf_path, int n_threads);  /* NULL on failure */
 /* Load a NESTED metric model from its two branches: the anyview (GIANT) GGUF and
    the metric (ViT-L + DPT/sky) GGUF. The returned ctx runs the nested metric
