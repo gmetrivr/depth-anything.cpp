@@ -93,14 +93,15 @@ Backend::Backend() : impl_(new Impl()) {
             return false;
         };
 
-        if (!want.empty()) {
+        const bool auto_gpu = want.empty() || iequals(want, "gpu") || iequals(want, "auto");
+        if (!auto_gpu) {
             // Explicit DA_DEVICE: match by name (e.g. "Vulkan1", "CUDA0").
             if (!try_pick([&](auto, const char* name) { return name && iequals(want, name); }))
                 DA_LOG("da::Backend: DA_DEVICE=%s not found; falling back to CPU",
                        want.c_str());
         } else {
-            // Auto-pick: prefer a DISCRETE GPU over an integrated one. On multi-GPU
-            // boxes the iGPU often enumerates first (device 0) but is far weaker and
+            // Auto-pick (or DA_DEVICE=gpu/auto): prefer a DISCRETE GPU over an integrated one.
+            // On multi-GPU boxes the iGPU often enumerates first (device 0) but is far weaker and
             // can wedge on big models — so only fall back to IGPU if no discrete GPU
             // is present.
             (void)(try_pick([](auto type, const char*) { return type == GGML_BACKEND_DEVICE_TYPE_GPU; }) ||

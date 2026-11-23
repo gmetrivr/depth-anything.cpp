@@ -15,6 +15,8 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <fstream>
 
 namespace da {
 
@@ -45,9 +47,161 @@ struct WindowRec {
     std::vector<int>     gf;          // global input-frame index per point, n
     std::vector<double>  key;         // downsampled LOCAL cloud for loop alignment, 3*m
     std::vector<double>  ccs, vds;    // per-frame camera centre / view dir (LOCAL), 3*nf interleaved
+    std::vector<float>   vdesc;       // normalized visual descriptor of middle frame for drift-free loop proposal
     int mid = 0;                      // global index of this window's representative frame
     int w0 = 0;                       // global index of this window's FIRST frame
 };
+
+static std::vector<float> compute_visual_desc(const uint8_t* rgb, int H, int W) {
+    if (!rgb || H < 8 || W < 8) return {};
+    // 4x4 spatial grid x 3 channels x 8 colour bins (384 dims) + 8x8 downsampled RGB patch (192 dims)
+    std::vector<float> d(384 + 192, 0.f);
+    for (int y = 0; y < H; ++y) {
+        int cy = std::min(3, (y * 4) / H);
+        int py = std::min(7, (y * 8) / H);
+        for (int x = 0; x < W; ++x) {
+            int cx = std::min(3, (x * 4) / W);
+            int px = std::min(7, (x * 8) / W);
+            const uint8_t* p = rgb + ((size_t)y * W + x) * 3;
+            int cell = (cy * 4 + cx) * 24;
+            d[cell + 0 + (p[0] >> 5)] += 1.f;
+            d[cell + 8 + (p[1] >> 5)] += 1.f;
+            d[cell + 16 + (p[2] >> 5)] += 1.f;
+            int poff = 384 + (py * 8 + px) * 3;
+            d[poff + 0] += p[0] * (1.f / 255.f);
+            d[poff + 1] += p[1] * (1.f / 255.f);
+            d[poff + 2] += p[2] * (1.f / 255.f);
+        }
+    }
+    auto norm_slice = [&](size_t a, size_t b) {
+        double m = 0;
+        for (size_t i = a; i < b; ++i) m += d[i];
+        m /= (double)(b - a);
+        double n2 = 0;
+        for (size_t i = a; i < b; ++i) { d[i] -= (float)m; n2 += (double)d[i] * d[i]; }
+        double inv = 1.0 / (std::sqrt(n2) + 1e-12);
+        for (size_t i = a; i < b; ++i) d[i] = (float)(d[i] * inv * 0.70710678);
+    };
+    norm_slice(0, 384);
+    norm_slice(384, 384 + 192);
+    return d;
+}
+
+template <typename T>
+static void write_pod(std::ostream& os, const T& v) {
+    os.write(reinterpret_cast<const char*>(&v), sizeof(T));
+}
+template <typename T>
+static bool read_pod(std::istream& is, T& v) {
+    return (bool)is.read(reinterpret_cast<char*>(&v), sizeof(T));
+}
+template <typename T>
+static void write_vec(std::ostream& os, const std::vector<T>& v) {
+    uint64_t n = (uint64_t)v.size();
+    write_pod(os, n);
+    if (n > 0) os.write(reinterpret_cast<const char*>(v.data()), (std::streamsize)(n * sizeof(T)));
+}
+template <typename T>
+static bool read_vec(std::istream& is, std::vector<T>& v) {
+    uint64_t n = 0;
+    if (!read_pod(is, n)) return false;
+    v.resize((size_t)n);
+    if (n > 0 && !is.read(reinterpret_cast<char*>(v.data()), (std::streamsize)(n * sizeof(T)))) return false;
+    return true;
+}
+
+static bool save_stream_ckpt(const std::string& path, int next_w0, int F, int chunk, int overlap,
+                             const Sim3& G, bool have_prev, const OverlapCache& prev,
+                             const std::vector<WindowRec>& wins) {
+    if (path.empty()) return false;
+    std::string tmp = path + ".tmp";
+    std::ofstream os(tmp, std::ios::binary | std::ios::trunc);
+    if (!os) return false;
+    const uint32_t magic = 0x44415343u; // "DASC"
+    write_pod(os, magic);
+    write_pod(os, next_w0); write_pod(os, F); write_pod(os, chunk); write_pod(os, overlap);
+    write_pod(os, G);
+    uint8_t hp = have_prev ? 1 : 0; write_pod(os, hp);
+    write_pod(os, prev.H); write_pod(os, prev.W); write_pod(os, prev.n); write_pod(os, prev.G);
+    write_vec(os, prev.valid); write_vec(os, prev.xyz); write_vec(os, prev.conf);
+    uint64_t nw = (uint64_t)wins.size(); write_pod(os, nw);
+    for (const auto& r : wins) {
+        write_pod(os, r.G); write_pod(os, r.S_rel); write_pod(os, r.mid); write_pod(os, r.w0);
+        write_vec(os, r.lx); write_vec(os, r.lc); write_vec(os, r.lr); write_vec(os, r.gf);
+        write_vec(os, r.key); write_vec(os, r.ccs); write_vec(os, r.vds); write_vec(os, r.vdesc);
+    }
+    os.close();
+    if (!os) return false;
+    return std::rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+static bool load_stream_ckpt(const std::string& path, int F, int chunk, int overlap,
+                             int& next_w0, Sim3& G, bool& have_prev, OverlapCache& prev,
+                             std::vector<WindowRec>& wins) {
+    if (path.empty()) return false;
+    std::ifstream is(path, std::ios::binary);
+    if (!is) return false;
+    uint32_t magic = 0; int cF = 0, cChunk = 0, cOverlap = 0;
+    if (!read_pod(is, magic) || magic != 0x44415343u) return false;
+    if (!read_pod(is, next_w0) || !read_pod(is, cF) || !read_pod(is, cChunk) || !read_pod(is, cOverlap)) return false;
+    if (cF != F || cChunk != chunk || cOverlap != overlap || next_w0 <= 0 || next_w0 >= F) return false;
+    if (!read_pod(is, G)) return false;
+    uint8_t hp = 0; if (!read_pod(is, hp)) return false; have_prev = (hp != 0);
+    if (!read_pod(is, prev.H) || !read_pod(is, prev.W) || !read_pod(is, prev.n) || !read_pod(is, prev.G)) return false;
+    if (!read_vec(is, prev.valid) || !read_vec(is, prev.xyz) || !read_vec(is, prev.conf)) return false;
+    uint64_t nw = 0; if (!read_pod(is, nw)) return false;
+    wins.resize((size_t)nw);
+    for (size_t i = 0; i < (size_t)nw; ++i) {
+        auto& r = wins[i];
+        if (!read_pod(is, r.G) || !read_pod(is, r.S_rel) || !read_pod(is, r.mid) || !read_pod(is, r.w0)) return false;
+        if (!read_vec(is, r.lx) || !read_vec(is, r.lc) || !read_vec(is, r.lr) || !read_vec(is, r.gf)) return false;
+        if (!read_vec(is, r.key) || !read_vec(is, r.ccs) || !read_vec(is, r.vds) || !read_vec(is, r.vdesc)) return false;
+    }
+    return true;
+}
+
+static void emit_wins_to_cloud(const std::vector<WindowRec>& wins, int F, int overlap, StreamCloud& out) {
+    const int Wn = (int)wins.size();
+    out.xyz.clear(); out.rgb.clear(); out.radius.clear();
+    out.counts.assign(F, 0);
+    out.window_pos.resize((size_t)3*Wn); out.window_mid_frame.resize(Wn);
+    out.frame_pos.assign((size_t)3*F, 0.f); out.frame_fwd.assign((size_t)3*F, 0.f);
+    for (int k = 0; k < Wn; ++k) {
+        const WindowRec& r = wins[k];
+        out.window_mid_frame[k] = r.mid;
+        double gcpos[3];
+        if (!r.ccs.empty()) { int mloc = (int)(r.ccs.size()/3)/2; sim3_apply(r.G, &r.ccs[3*mloc], gcpos); }
+        else { gcpos[0]=r.G.t[0]; gcpos[1]=r.G.t[1]; gcpos[2]=r.G.t[2]; }
+        out.window_pos[3*k+0]=(float)gcpos[0]; out.window_pos[3*k+1]=(float)gcpos[1]; out.window_pos[3*k+2]=(float)gcpos[2];
+
+        const int nf = (int)(r.ccs.size()/3);
+        const int lo = (r.w0 == 0) ? 0 : overlap;
+        for (int i = lo; i < nf; ++i) {
+            const int g = r.w0 + i;
+            if (g < 0 || g >= F) continue;
+            double gp[3]; sim3_apply(r.G, &r.ccs[3*i], gp);
+            const double* vd = &r.vds[3*i];
+            double d[3] = { r.G.R[0]*vd[0]+r.G.R[1]*vd[1]+r.G.R[2]*vd[2],
+                            r.G.R[3]*vd[0]+r.G.R[4]*vd[1]+r.G.R[5]*vd[2],
+                            r.G.R[6]*vd[0]+r.G.R[7]*vd[1]+r.G.R[8]*vd[2] };
+            double dn = std::sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]) + 1e-30;
+            out.frame_pos[3*g+0]=(float)gp[0]; out.frame_pos[3*g+1]=(float)gp[1]; out.frame_pos[3*g+2]=(float)gp[2];
+            out.frame_fwd[3*g+0]=(float)(d[0]/dn); out.frame_fwd[3*g+1]=(float)(d[1]/dn); out.frame_fwd[3*g+2]=(float)(d[2]/dn);
+        }
+        const int n = (int)(r.lr.size());
+        for (int i = 0; i < n; ++i) {
+            double pL[3] = { r.lx[3*i+0], r.lx[3*i+1], r.lx[3*i+2] }, pG[3];
+            sim3_apply(r.G, pL, pG);
+            out.xyz.push_back((float)pG[0]); out.xyz.push_back((float)pG[1]); out.xyz.push_back((float)pG[2]);
+            out.rgb.push_back(r.lc[3*i+0]); out.rgb.push_back(r.lc[3*i+1]); out.rgb.push_back(r.lc[3*i+2]);
+            float rr = r.lr[i] * (float)r.G.s;
+            if (!(rr > 0.f) || !std::isfinite(rr)) rr = 1e-4f;
+            out.radius.push_back(rr);
+            int gframe = r.gf[i];
+            if (gframe >= 0 && gframe < F) out.counts[gframe]++;
+        }
+    }
+}
 
 // Back-project one frame's pixels into LOCAL world space, filling dense valid/xyz/conf.
 // Validity is GEOMETRIC only (finite, d>0) — alignment uses conf as a weight, not a
@@ -107,13 +261,12 @@ static CamCenterDir cam_center_dir_local(const std::array<float,16>& E4) {
 // a small room would match across the room and fit a garbage transform. Returns
 // the relative Sim3 Z (b-local -> a-local) and the ICP correspondence count; false
 // when the true overlap is too thin (filters a mis-proposed candidate).
-static bool measure_loop(const WindowRec& a, const WindowRec& b, const IcpParams& mp,
-                         double match_gate, int min_corr, Sim3& Z_out, int& corr_out) {
+static bool measure_loop_with_seed(const WindowRec& a, const WindowRec& b, const Sim3& init0,
+                                   const IcpParams& mp, double match_gate, int min_corr,
+                                   Sim3& Z_out, int& corr_out) {
     const int nb = (int)(b.key.size()/3), na = (int)(a.key.size()/3);
     if (nb < min_corr || na < min_corr) return false;
 
-    // Seed: the drifted sequential relative pose (b-local -> a-local).
-    Sim3 init0 = sim3_compose(sim3_inverse(a.G), b.G);
     SpatialHash hash(a.key.data(), na, std::max(match_gate, 1e-3));
     std::vector<double> src, tgt, w; double d2;
     for (int i=0;i<nb;++i) {
@@ -138,6 +291,24 @@ static bool measure_loop(const WindowRec& a, const WindowRec& b, const IcpParams
     if (!ir.ok || ir.corr < min_corr) return false;
     Z_out = ir.T; corr_out = ir.corr;
     return true;
+}
+
+static bool measure_loop(const WindowRec& a, const WindowRec& b, const IcpParams& mp,
+                         double match_gate, int min_corr, Sim3& Z_out, int& corr_out,
+                         bool visual_seed = false) {
+    // 1. Try the sequential relative pose seed (G_a^{-1} o G_b).
+    Sim3 init0 = sim3_compose(sim3_inverse(a.G), b.G);
+    if (measure_loop_with_seed(a, b, init0, mp, match_gate, min_corr, Z_out, corr_out))
+        return true;
+    // 2. When proposed by visual appearance similarity across a long drifted trajectory,
+    //    both windows' local clouds are already in their own camera frames facing the
+    //    same scene — seed with identity in local camera space.
+    if (visual_seed) {
+        Sim3 id;
+        if (measure_loop_with_seed(a, b, id, mp, match_gate * 1.5, min_corr, Z_out, corr_out))
+            return true;
+    }
+    return false;
 }
 
 // Pure sliding-window stitch/fuse. Pulls each window's fused views + color from
@@ -167,13 +338,20 @@ bool stream_points_core(int nframes, const StreamParams& p,
     OverlapCache prev;      // previous window's tail-overlap geometry
     bool have_prev = false;
     std::vector<WindowRec> wins;   // per-window records (deferred emit)
+    int start_w0 = 0;
+    if (!p.checkpoint_path.empty() &&
+        load_stream_ckpt(p.checkpoint_path, F, chunk, overlap, start_w0, G, have_prev, prev, wins)) {
+        DA_LOG("stream: resumed from checkpoint %s at frame %d/%d (%zu windows)",
+               p.checkpoint_path.c_str(), start_w0, F, wins.size());
+        if (p.on_progress) p.on_progress(start_w0, F);
+    }
 
     // Phase-timing telemetry. Separates GPU inference (source()) from the
     // single-threaded CPU geometry (stitch/ICP, loop closure, emit) so we can
     // see where wall-clock actually goes and whether the GPU is starved.
     double t_infer = 0, t_stitch = 0, t_loop = 0, t_emit = 0;
 
-    for (int w0 = 0; w0 < F; w0 += step) {
+    for (int w0 = start_w0; w0 < F; w0 += step) {
         const int w1 = std::min(w0 + chunk, F);
         const int nv = w1 - w0;
 
@@ -254,6 +432,40 @@ bool stream_points_core(int nframes, const StreamParams& p,
                 DA_LOG("stream: window @%d degenerate stitch (M=%d) -> identity seam", w0, M);
                 S_rel = Sim3();
             } else {
+                // On long sequences (F > 100) without metric branch, guard against
+                // cumulative Sim3 scale drift (G.s collapsing toward 0 or blowing up
+                // over hundreds of windows) while preserving the overlap centroid match
+                // before point-to-plane ICP refinement.
+                if (F > 100 && !p.metric && S_rel.s > 0.0) {
+                    double s_old = S_rel.s;
+                    double s_new = std::max(0.85, std::min(1.18, s_old));
+                    double g_next = prev.G.s * s_new;
+                    if (g_next < 0.5) s_new = 0.5 / prev.G.s;
+                    if (g_next > 2.0) s_new = 2.0 / prev.G.s;
+                    if (std::fabs(s_new - s_old) > 1e-6) {
+                        double wsum = 0.0, ms[3] = {0, 0, 0};
+                        for (int i = 0; i < M; ++i) {
+                            double wi = wv[i];
+                            wsum += wi;
+                            ms[0] += wi * srcv[3*i+0];
+                            ms[1] += wi * srcv[3*i+1];
+                            ms[2] += wi * srcv[3*i+2];
+                        }
+                        if (wsum > 0.0) {
+                            ms[0] /= wsum; ms[1] /= wsum; ms[2] /= wsum;
+                            double rmsrc[3] = {
+                                S_rel.R[0]*ms[0] + S_rel.R[1]*ms[1] + S_rel.R[2]*ms[2],
+                                S_rel.R[3]*ms[0] + S_rel.R[4]*ms[1] + S_rel.R[5]*ms[2],
+                                S_rel.R[6]*ms[0] + S_rel.R[7]*ms[1] + S_rel.R[8]*ms[2]
+                            };
+                            double ds = s_old - s_new;
+                            S_rel.t[0] += ds * rmsrc[0];
+                            S_rel.t[1] += ds * rmsrc[1];
+                            S_rel.t[2] += ds * rmsrc[2];
+                            S_rel.s = s_new;
+                        }
+                    }
+                }
                 DA_LOG("stream: window @%d stitch M=%d s=%.4f rms=%.4g", w0, M, S_rel.s, rms);
                 if (p.icp_refine) {
                     // Scale the ICP neighbourhood/gates to the overlap's OWN extent —
@@ -336,6 +548,9 @@ bool stream_points_core(int nframes, const StreamParams& p,
             for (int i = 0; i < n; i += ks) {
                 rec.key.push_back(rec.lx[3*i]); rec.key.push_back(rec.lx[3*i+1]); rec.key.push_back(rec.lx[3*i+2]);
             }
+            if (!rgb_store.empty()) {
+                rec.vdesc = compute_visual_desc(rgb_store[nv/2].data(), H, W);
+            }
         }
         wins.push_back(std::move(rec));
 
@@ -355,7 +570,22 @@ bool stream_points_core(int nframes, const StreamParams& p,
         have_prev = true;
 
         t_stitch += secs_since(t_cpu);
+        if (p.on_progress) p.on_progress(w1, F);
+        const int ckpt_every = p.checkpoint_every > 0 ? p.checkpoint_every : 20;
+        if (w1 < F && ((int)wins.size() % ckpt_every == 0)) {
+            if (!p.checkpoint_path.empty()) {
+                save_stream_ckpt(p.checkpoint_path, w0 + step, F, chunk, overlap, G, have_prev, prev, wins);
+            }
+            if (p.on_checkpoint) {
+                StreamCloud partial;
+                emit_wins_to_cloud(wins, w1, overlap, partial);
+                p.on_checkpoint(w1, F, partial);
+            }
+        }
         if (w1 >= F) break;  // last (possibly truncated) window processed
+    }
+    if (!p.checkpoint_path.empty()) {
+        std::remove(p.checkpoint_path.c_str());
     }
 
     // --- task C: detect + measure loops, optimize the Sim3 pose graph ---
@@ -399,14 +629,24 @@ bool stream_points_core(int nframes, const StreamParams& p,
             }
             return false;
         };
+        auto visual_overlap = [&](int a, int b) -> bool {
+            const auto& va = wins[a].vdesc;
+            const auto& vb = wins[b].vdesc;
+            if (va.empty() || va.size() != vb.size()) return false;
+            double dot = 0;
+            for (size_t i = 0; i < va.size(); ++i) dot += (double)va[i] * vb[i];
+            return dot >= 0.85;
+        };
         IcpParams mp = p.icp; if (!(mp.max_corr_dist > 0)) mp.max_corr_dist = 0.2;
         for (int a = 0; a < Wn; ++a) for (int b = a + p.loop_min_gap; b < Wn; ++b) {
-            if (!windows_overlap(a, b)) continue;
+            const bool geom_ov = windows_overlap(a, b);
+            const bool vis_ov  = !geom_ov && visual_overlap(a, b);
+            if (!geom_ov && !vis_ov) continue;
             Sim3 Z; int corr = 0;
-            if (!measure_loop(wins[a], wins[b], mp, p.loop_match_dist, p.loop_min_corr, Z, corr)) continue;
+            if (!measure_loop(wins[a], wins[b], mp, p.loop_match_dist, p.loop_min_corr, Z, corr, vis_ov)) continue;
             pg.edges.push_back(PoseEdge{ a, b, Z, p.loop_info, true });
             out.loops_found++;
-            DA_LOG("stream: loop closure %d<->%d corr=%d", a, b, corr);
+            DA_LOG("stream: loop closure %d<->%d (%s) corr=%d", a, b, vis_ov ? "visual" : "spatial", corr);
         }
 
         if (out.loops_found > 0) {
@@ -421,47 +661,7 @@ bool stream_points_core(int nframes, const StreamParams& p,
 
     // --- deferred emit pass: transform each window's LOCAL points by its final G ---
     auto t_emit0 = da_clock::now();
-    out.window_pos.resize((size_t)3*Wn); out.window_mid_frame.resize(Wn);
-    out.frame_pos.assign((size_t)3*F, 0.f); out.frame_fwd.assign((size_t)3*F, 0.f);
-    for (int k = 0; k < Wn; ++k) {
-        const WindowRec& r = wins[k];
-        out.window_mid_frame[k] = r.mid;
-        double gcpos[3];
-        if (!r.ccs.empty()) { int mloc = (int)(r.ccs.size()/3)/2; sim3_apply(r.G, &r.ccs[3*mloc], gcpos); }
-        else { gcpos[0]=r.G.t[0]; gcpos[1]=r.G.t[1]; gcpos[2]=r.G.t[2]; }
-        out.window_pos[3*k+0]=(float)gcpos[0]; out.window_pos[3*k+1]=(float)gcpos[1]; out.window_pos[3*k+2]=(float)gcpos[2];
-
-        // Per-input-frame global camera pose. Each frame is owned by the window whose
-        // NON-overlap region contains it (lo..nf), so windows tile the frames and every
-        // input frame gets exactly one pose (centre + unit forward, OpenCV axes).
-        const int nf = (int)(r.ccs.size()/3);
-        const int lo = (r.w0 == 0) ? 0 : overlap;
-        for (int i = lo; i < nf; ++i) {
-            const int g = r.w0 + i;
-            if (g < 0 || g >= F) continue;
-            double gp[3]; sim3_apply(r.G, &r.ccs[3*i], gp);
-            const double* vd = &r.vds[3*i];
-            double d[3] = { r.G.R[0]*vd[0]+r.G.R[1]*vd[1]+r.G.R[2]*vd[2],
-                            r.G.R[3]*vd[0]+r.G.R[4]*vd[1]+r.G.R[5]*vd[2],
-                            r.G.R[6]*vd[0]+r.G.R[7]*vd[1]+r.G.R[8]*vd[2] };
-            double dn = std::sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]) + 1e-30;
-            out.frame_pos[3*g+0]=(float)gp[0]; out.frame_pos[3*g+1]=(float)gp[1]; out.frame_pos[3*g+2]=(float)gp[2];
-            out.frame_fwd[3*g+0]=(float)(d[0]/dn); out.frame_fwd[3*g+1]=(float)(d[1]/dn); out.frame_fwd[3*g+2]=(float)(d[2]/dn);
-        }
-        const int n = (int)(r.lr.size());
-        for (int i = 0; i < n; ++i) {
-            double pL[3] = { r.lx[3*i+0], r.lx[3*i+1], r.lx[3*i+2] }, pG[3];
-            sim3_apply(r.G, pL, pG);
-            out.xyz.push_back((float)pG[0]); out.xyz.push_back((float)pG[1]); out.xyz.push_back((float)pG[2]);
-            out.rgb.push_back(r.lc[3*i+0]); out.rgb.push_back(r.lc[3*i+1]); out.rgb.push_back(r.lc[3*i+2]);
-            float rr = r.lr[i] * (float)r.G.s;
-            if (!(rr > 0.f) || !std::isfinite(rr)) rr = 1e-4f;
-            out.radius.push_back(rr);
-            int gframe = r.gf[i];
-            if (gframe >= 0 && gframe < F) out.counts[gframe]++;
-        }
-    }
-
+    emit_wins_to_cloud(wins, F, overlap, out);
     t_emit = secs_since(t_emit0);
     DA_LOG("stream timing: infer(gpu)=%.2fs stitch(cpu)=%.2fs loop(cpu)=%.2fs emit(cpu)=%.2fs "
            "| windows=%d loops=%d pts=%zu", t_infer, t_stitch, t_loop, t_emit,

@@ -422,10 +422,13 @@ bool DinoBackbone::forward_mv(const std::vector<std::vector<float>>& views_chw, 
 
     // --- Pass A: select reference view from layer-(alt_start-1) input = output of
     //     block (alt_start-2). Run per-view LOCAL blocks [0, alt_start-1). ---
-    const int embed=(int)c.embed_dim;
-    std::vector<std::vector<float>> cls;
-    if (!capture_local_cls(views_chw, H, W, c.alt_start-1, cls)) return false;
-    int b_idx = select_reference_view_saddle(cls, embed);
+    int b_idx = S / 2;
+    if (!std::getenv("DA_FAST_MV")) {
+        const int embed=(int)c.embed_dim;
+        std::vector<std::vector<float>> cls;
+        if (!capture_local_cls(views_chw, H, W, c.alt_start-1, cls)) return false;
+        b_idx = select_reference_view_saddle(cls, embed);
+    }
     if (out_b_idx) *out_b_idx = b_idx;
 
     // reorder_by_reference: position 0 <- b_idx; positions 1..b_idx <- 0..b_idx-1;

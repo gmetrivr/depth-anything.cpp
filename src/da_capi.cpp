@@ -18,12 +18,20 @@
 #include <cstring>
 #include <string>
 #include <array>
+#include <atomic>
+#include <mutex>
 #include <utility>
 #include <vector>
 
 struct da_ctx {
     std::unique_ptr<da::Engine> engine;
     std::string last_error;
+    std::atomic<int> stream_done{0};
+    std::string checkpoint_path;
+    std::mutex ckpt_mu;
+    da::StreamCloud ckpt_cloud;
+    int ckpt_done = 0;
+    int ckpt_seq = 0;
     // Per-frame capture poses from the most recent da_capi_points_stream call (OpenCV
     // axes, 3F each). da_capi_points_stream is at the purego arg-count ceiling, so these
     // are retrieved via da_capi_stream_last_poses instead of as out-params.
@@ -106,6 +114,51 @@ void da_capi_set_temporal_voxel_mesh(da_ctx* c, int enabled){
     if (!c) return;
     c->temporal_voxel_mesh_enabled = (enabled != 0);
 }
+int da_capi_stream_progress(da_ctx* c){
+    return c ? c->stream_done.load(std::memory_order_relaxed) : 0;
+}
+void da_capi_set_checkpoint_path(da_ctx* c, const char* path){
+    if (!c) return;
+    c->checkpoint_path = path ? path : "";
+}
+int da_capi_stream_poll_checkpoint(da_ctx* c, int last_seq, int* out_seq, int* out_done,
+                                   int* out_n, int* out_nframes, int** out_counts,
+                                   float** out_xyz, unsigned char** out_rgb, float** out_rad,
+                                   float** out_pos, float** out_fwd){
+    if (!c) return 0;
+    std::lock_guard<std::mutex> lk(c->ckpt_mu);
+    if (c->ckpt_seq <= last_seq || c->ckpt_cloud.radius.empty()) return 0;
+    const auto& sc = c->ckpt_cloud;
+    const int N = (int)sc.radius.size();
+    const int F = (int)sc.counts.size();
+    float* xyz = (float*)std::malloc(sc.xyz.size() * sizeof(float));
+    unsigned char* rgb = (unsigned char*)std::malloc(sc.rgb.size());
+    float* rad = (float*)std::malloc(sc.radius.size() * sizeof(float));
+    int* cnt = (int*)std::malloc(sc.counts.size() * sizeof(int));
+    float* pos = (float*)std::malloc(sc.frame_pos.size() * sizeof(float));
+    float* fwd = (float*)std::malloc(sc.frame_fwd.size() * sizeof(float));
+    if (!xyz || !rgb || !rad || !cnt || !pos || !fwd){
+        std::free(xyz); std::free(rgb); std::free(rad); std::free(cnt); std::free(pos); std::free(fwd);
+        return 0;
+    }
+    std::memcpy(xyz, sc.xyz.data(), sc.xyz.size() * sizeof(float));
+    std::memcpy(rgb, sc.rgb.data(), sc.rgb.size());
+    std::memcpy(rad, sc.radius.data(), sc.radius.size() * sizeof(float));
+    std::memcpy(cnt, sc.counts.data(), sc.counts.size() * sizeof(int));
+    std::memcpy(pos, sc.frame_pos.data(), sc.frame_pos.size() * sizeof(float));
+    std::memcpy(fwd, sc.frame_fwd.data(), sc.frame_fwd.size() * sizeof(float));
+    *out_seq = c->ckpt_seq;
+    *out_done = c->ckpt_done;
+    *out_n = N;
+    *out_nframes = F;
+    *out_counts = cnt;
+    *out_xyz = xyz;
+    *out_rgb = rgb;
+    *out_rad = rad;
+    *out_pos = pos;
+    *out_fwd = fwd;
+    return 1;
+}
 da_ctx* da_capi_load(const char* path, int n_threads){
     if (!path) return nullptr;
     auto e = da::Engine::load(path, n_threads);
@@ -124,7 +177,9 @@ char* da_capi_info_json(da_ctx* c){
     const auto& cfg = c->engine->config();
     std::string j = "{\"checkpoint\":\"" + json_escape(cfg.checkpoint_name) + "\",\"embed_dim\":" +
         std::to_string(cfg.embed_dim) + ",\"depth\":" + std::to_string(cfg.depth) +
-        ",\"num_heads\":" + std::to_string(cfg.num_heads) + "}";
+        ",\"num_heads\":" + std::to_string(cfg.num_heads) +
+        ",\"device\":\"" + json_escape(c->engine->device_name()) + "\"" +
+        ",\"gpu\":" + (c->engine->is_offloading() ? "true" : "false") + "}";
     return dup_cstr(j);
 }
 void da_capi_free_string(char* s){ std::free(s); }
@@ -419,6 +474,22 @@ int da_capi_points_stream(da_ctx* c, const char** image_paths, int n_images,
     if (sp.metric && !c->engine->is_nested()){
         c->last_error = "points_stream: metric requires a nested (anyview+metric) model; load via da_capi_load_nested";
         return -1; }
+    c->stream_done.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(c->ckpt_mu);
+        c->ckpt_seq = 0;
+        c->ckpt_done = 0;
+        c->ckpt_cloud = da::StreamCloud{};
+    }
+    sp.checkpoint_path = c->checkpoint_path;
+    sp.checkpoint_every = 20;
+    sp.on_progress = [c](int done, int){ c->stream_done.store(done, std::memory_order_relaxed); };
+    sp.on_checkpoint = [c](int done, int, const da::StreamCloud& partial){
+        std::lock_guard<std::mutex> lk(c->ckpt_mu);
+        c->ckpt_cloud = partial;
+        c->ckpt_done = done;
+        c->ckpt_seq++;
+    };
 
     da::StreamCloud sc;
     if (!da::stream_points(*c->engine, paths, c->engine->config(), sp, sc, c->last_error)) return -1;

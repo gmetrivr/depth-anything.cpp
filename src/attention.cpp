@@ -18,19 +18,14 @@ namespace da {
 // anyway). DA_ATTN=manual restores the old materialized-scores path.
 enum class AttnMode { Manual, Flash, Skip };
 static AttnMode attn_mode(){
-    static const int env = []{
-        const char* e = std::getenv("DA_ATTN");
-        if (e && std::strcmp(e, "manual") == 0) return 1;  // forced manual
-        if (e && std::strcmp(e, "skip")   == 0) return 2;  // forced skip
-        if (e && std::strcmp(e, "flash")  == 0) return 3;  // forced flash
-        return 0;                                          // unset -> auto
-    }();
-    switch (env) {
-        case 1:  return AttnMode::Manual;
-        case 2:  return AttnMode::Skip;
-        case 3:  return AttnMode::Flash;
-        default: return AttnMode::Flash;   // Flash on both CPU and GPU (CUDA flash_attn_ext, F32 prec)
-    }
+    const char* e = std::getenv("DA_ATTN");
+    if (e && std::strcmp(e, "manual") == 0) return AttnMode::Manual;  // forced manual
+    if (e && std::strcmp(e, "skip")   == 0) return AttnMode::Skip;    // forced skip
+    if (e && std::strcmp(e, "flash")  == 0) return AttnMode::Flash;   // forced flash
+    // On GPU (especially Vulkan GPUs without coopmat2/FP16 like Pascal/GTX 1080 Ti),
+    // the manual mul_mat + soft_max_ext path uses tiled GEMM shaders and is ~2.5x
+    // faster than the scalar flash_attn_ext fallback; on CPU, Flash is fastest.
+    return da::gpu_mode() ? AttnMode::Manual : AttnMode::Flash;
 }
 AttnWeights load_attn(const ModelLoader& ml, int i){
     auto t=[&](const char* s){ return ml.tensor("vit.blk."+std::to_string(i)+"."+s); };

@@ -20,6 +20,8 @@ type capi struct {
 	load        func(string, int32) uintptr
 	loadNested  func(string, string, int32) uintptr
 	freeCtx     func(uintptr)
+	infoJSONP   func(uintptr) uintptr
+	freeString  func(uintptr)
 	lastErrP    func(uintptr) uintptr
 	freeFloats  func(uintptr)
 	freeBytes   func(uintptr)
@@ -30,6 +32,10 @@ type capi struct {
 		outN, outCounts, outXyz, outRgb, outRad unsafe.Pointer) int32
 	streamPoses     func(ctx uintptr, outPos, outFwd, outNFrames unsafe.Pointer) int32
 	streamVoxelMesh func(ctx uintptr, outData, outSize unsafe.Pointer) int32
+	streamProgress  func(ctx uintptr) int32
+	setCkptPath     func(ctx uintptr, path string)
+	pollCkpt        func(ctx uintptr, lastSeq int32, outSeq, outDone, outN, outNFrames,
+		outCounts, outXyz, outRgb, outRad, outPos, outFwd unsafe.Pointer) int32
 	// Scene-relative TSDF fusion knobs applied to the next pointsStream fuse.
 	setFuseParams        func(ctx uintptr, voxelFrac, truncMult float64)
 	setTemporalVoxelMesh func(ctx uintptr, enabled int32)
@@ -51,6 +57,8 @@ func openCAPI(libPath string) (*capi, error) {
 	purego.RegisterLibFunc(&a.load, h, "da_capi_load")
 	purego.RegisterLibFunc(&a.loadNested, h, "da_capi_load_nested")
 	purego.RegisterLibFunc(&a.freeCtx, h, "da_capi_free")
+	purego.RegisterLibFunc(&a.infoJSONP, h, "da_capi_info_json")
+	purego.RegisterLibFunc(&a.freeString, h, "da_capi_free_string")
 	purego.RegisterLibFunc(&a.lastErrP, h, "da_capi_last_error")
 	purego.RegisterLibFunc(&a.freeFloats, h, "da_capi_free_floats")
 	purego.RegisterLibFunc(&a.freeBytes, h, "da_capi_free_bytes")
@@ -58,6 +66,9 @@ func openCAPI(libPath string) (*capi, error) {
 	purego.RegisterLibFunc(&a.pointsStream, h, "da_capi_points_stream")
 	purego.RegisterLibFunc(&a.streamPoses, h, "da_capi_stream_last_poses")
 	purego.RegisterLibFunc(&a.streamVoxelMesh, h, "da_capi_stream_last_voxel_mesh")
+	purego.RegisterLibFunc(&a.streamProgress, h, "da_capi_stream_progress")
+	purego.RegisterLibFunc(&a.setCkptPath, h, "da_capi_set_checkpoint_path")
+	purego.RegisterLibFunc(&a.pollCkpt, h, "da_capi_stream_poll_checkpoint")
 	purego.RegisterLibFunc(&a.setFuseParams, h, "da_capi_set_fuse_params")
 	purego.RegisterLibFunc(&a.setTemporalVoxelMesh, h, "da_capi_set_temporal_voxel_mesh")
 	purego.RegisterLibFunc(&a.gaussians, h, "da_capi_gaussians")
@@ -65,6 +76,15 @@ func openCAPI(libPath string) (*capi, error) {
 }
 
 func (a *capi) lastErr(ctx uintptr) string { return cstr(a.lastErrP(ctx)) }
+
+func (a *capi) infoJSON(ctx uintptr) string {
+	p := a.infoJSONP(ctx)
+	if p == 0 {
+		return ""
+	}
+	defer a.freeString(p)
+	return cstr(p)
+}
 
 // cstr reads a NUL-terminated C string at p (0 -> "").
 func cstr(p uintptr) string {
@@ -221,6 +241,43 @@ func (a *capi) PointsStream(ctx uintptr, paths []string, chunk, overlap int, con
 		}
 	}
 	return cl, nil
+}
+
+func (a *capi) SetCheckpointPath(ctx uintptr, path string) {
+	a.setCkptPath(ctx, path)
+}
+
+func (a *capi) PollCheckpoint(ctx uintptr, lastSeq int) (*Cloud, int, int) {
+	var seq, done, n, nf int32
+	var pCnt, pXyz, pRgb, pRad, pPos, pFwd uintptr
+	rc := a.pollCkpt(ctx, int32(lastSeq),
+		unsafe.Pointer(&seq), unsafe.Pointer(&done),
+		unsafe.Pointer(&n), unsafe.Pointer(&nf),
+		unsafe.Pointer(&pCnt), unsafe.Pointer(&pXyz),
+		unsafe.Pointer(&pRgb), unsafe.Pointer(&pRad),
+		unsafe.Pointer(&pPos), unsafe.Pointer(&pFwd))
+	if rc == 0 || n <= 0 {
+		return nil, lastSeq, 0
+	}
+	np := int(n)
+	nfr := int(nf)
+	var counts []int32
+	if pCnt != 0 && nfr > 0 {
+		counts = make([]int32, nfr)
+		copy(counts, unsafe.Slice((*int32)(unsafe.Pointer(pCnt)), nfr))
+		a.freeFloats(pCnt)
+	}
+	cl := &Cloud{
+		N: np, Counts: counts,
+		XYZ: cFloats(pXyz, np*3), RGB: cBytes(pRgb, np*3), Rad: cFloats(pRad, np),
+		FramePos: cFloats(pPos, nfr*3), FrameFwd: cFloats(pFwd, nfr*3),
+	}
+	a.freeFloats(pXyz)
+	a.freeBytes(pRgb)
+	a.freeFloats(pRad)
+	a.freeFloats(pPos)
+	a.freeFloats(pFwd)
+	return cl, int(seq), int(done)
 }
 
 // GS is a single-image 3D-gaussian set (world frame, OpenCV axes).

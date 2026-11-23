@@ -4,10 +4,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -51,29 +53,76 @@ func findModel(name string) *ModelInfo {
 
 // loaded is one resident model context plus a serialization lock.
 type loaded struct {
-	ctx   uintptr
-	runMu sync.Mutex
+	ctx       uintptr
+	device    string
+	gpu       bool
+	runMu     sync.Mutex
 }
 
 // Registry lazily loads/evicts model contexts. All inference goes through
 // WithModel, which holds the registry lock across load+run so eviction can never
 // free a context that is in use (max-live defaults to 1 for the big checkpoints).
 type Registry struct {
-	api       *capi
-	dir       string
-	threads   int32
-	maxLive   int
-	mu        sync.Mutex
-	live      map[string]*loaded
-	order     []string // LRU, oldest first
+	api        *capi
+	dir        string
+	threads    int32
+	maxLive    int
+	devicePref string // "gpu" (default, auto-pick discrete GPU) or "cpu"
+	activeDev  string // resolved device name from last loaded model (e.g. "Vulkan0", "cpu")
+	activeGPU  bool
+	mu         sync.Mutex
+	live       map[string]*loaded
+	order      []string // LRU, oldest first
 }
 
-func NewRegistry(api *capi, dir string, threads, maxLive int) *Registry {
+func NewRegistry(api *capi, dir string, threads, maxLive int, devicePref string) *Registry {
 	if maxLive < 1 {
 		maxLive = 1
 	}
+	devicePref = normDevicePref(devicePref)
+	_ = os.Setenv("DA_DEVICE", devicePref)
 	return &Registry{api: api, dir: dir, threads: int32(threads), maxLive: maxLive,
-		live: map[string]*loaded{}}
+		devicePref: devicePref, live: map[string]*loaded{}}
+}
+
+func normDevicePref(d string) string {
+	d = strings.ToLower(strings.TrimSpace(d))
+	if d == "cpu" {
+		return "cpu"
+	}
+	return "gpu"
+}
+
+func (r *Registry) DeviceStatus() (pref, active string, gpu bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.devicePref, r.activeDev, r.activeGPU
+}
+
+// SetDevice switches the preferred device ("gpu" or "cpu") and evicts resident
+// models if the preference changed so the next inference loads on the chosen device.
+func (r *Registry) SetDevice(pref string) (string, string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.setDeviceLocked(pref)
+	return r.devicePref, r.activeDev, r.activeGPU
+}
+
+func (r *Registry) setDeviceLocked(pref string) {
+	np := normDevicePref(pref)
+	if np == r.devicePref {
+		return
+	}
+	r.devicePref = np
+	_ = os.Setenv("DA_DEVICE", np)
+	for _, ev := range r.order {
+		r.api.freeCtx(r.live[ev].ctx)
+		delete(r.live, ev)
+		log.Printf("model: evicted %s (device switch -> %s)", ev, np)
+	}
+	r.order = nil
+	r.activeDev = ""
+	r.activeGPU = false
 }
 
 // available returns the catalog entries whose files are present on disk.
@@ -102,8 +151,15 @@ func (r *Registry) present(m *ModelInfo) bool {
 // WithModel loads (or reuses) the named model and runs fn with its context held
 // under both the registry lock and the model's run lock.
 func (r *Registry) WithModel(name string, fn func(ctx uintptr, mi *ModelInfo) error) error {
+	return r.WithModelOnDevice(name, "", fn)
+}
+
+func (r *Registry) WithModelOnDevice(name, devPref string, fn func(ctx uintptr, mi *ModelInfo) error) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if devPref != "" {
+		r.setDeviceLocked(devPref)
+	}
 	mi := findModel(name)
 	if mi == nil {
 		return fmt.Errorf("unknown model %q", name)
@@ -120,6 +176,7 @@ func (r *Registry) WithModel(name string, fn func(ctx uintptr, mi *ModelInfo) er
 			delete(r.live, ev)
 			log.Printf("model: evicted %s", ev)
 		}
+		_ = os.Setenv("DA_DEVICE", r.devicePref)
 		var ctx uintptr
 		if mi.File2 != "" {
 			ctx = r.api.loadNested(filepath.Join(r.dir, mi.File), filepath.Join(r.dir, mi.File2), r.threads)
@@ -129,11 +186,25 @@ func (r *Registry) WithModel(name string, fn func(ctx uintptr, mi *ModelInfo) er
 		if ctx == 0 {
 			return fmt.Errorf("failed to load model %q", name)
 		}
-		l = &loaded{ctx: ctx}
+		var info struct {
+			Device string `json:"device"`
+			GPU    bool   `json:"gpu"`
+		}
+		if raw := r.api.infoJSON(ctx); raw != "" {
+			_ = json.Unmarshal([]byte(raw), &info)
+		}
+		if info.Device == "" {
+			info.Device = r.devicePref
+		}
+		r.activeDev = info.Device
+		r.activeGPU = info.GPU
+		l = &loaded{ctx: ctx, device: info.Device, gpu: info.GPU}
 		r.live[name] = l
 		r.order = append(r.order, name)
-		log.Printf("model: loaded %s", name)
+		log.Printf("model: loaded %s on device=%s (gpu=%v)", name, info.Device, info.GPU)
 	} else {
+		r.activeDev = l.device
+		r.activeGPU = l.gpu
 		// move to MRU
 		for i, n := range r.order {
 			if n == name {
