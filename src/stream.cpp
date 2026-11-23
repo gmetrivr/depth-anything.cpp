@@ -492,6 +492,34 @@ bool stream_points_core(int nframes, const StreamParams& p,
                 }
             }
             G = sim3_compose(prev.G, S_rel);  // cur-local -> global
+            if (F > 100 && !p.metric && M > 0) {
+                // Gravity / flat-floor constraint for long store scans: project G.R onto
+                // SO(2) yaw around the vertical Y-axis (zero pitch/roll drift) and lock
+                // the window's camera vertical offset G.t[1] = 0 while preserving the
+                // horizontal (X, Z) overlap centroid match.
+                double wsum = 0.0, ms[3] = {0, 0, 0};
+                for (int i = 0; i < M; ++i) {
+                    double wi = wv[i];
+                    wsum += wi;
+                    ms[0] += wi * srcv[3*i+0];
+                    ms[1] += wi * srcv[3*i+1];
+                    ms[2] += wi * srcv[3*i+2];
+                }
+                if (wsum > 0.0) {
+                    ms[0] /= wsum; ms[1] /= wsum; ms[2] /= wsum;
+                    double p_glob[3];
+                    sim3_apply(G, ms, p_glob);
+                    double yaw = std::atan2(G.R[2] - G.R[6], G.R[0] + G.R[8]);
+                    double cy = std::cos(yaw), sy = std::sin(yaw);
+                    G.R[0] =  cy; G.R[1] = 0.0; G.R[2] = sy;
+                    G.R[3] = 0.0; G.R[4] = 1.0; G.R[5] = 0.0;
+                    G.R[6] = -sy; G.R[7] = 0.0; G.R[8] = cy;
+                    G.t[0] = p_glob[0] - G.s * (G.R[0]*ms[0] + G.R[2]*ms[2]);
+                    G.t[1] = 0.0;
+                    G.t[2] = p_glob[2] - G.s * (G.R[6]*ms[0] + G.R[8]*ms[2]);
+                    S_rel = sim3_compose(sim3_inverse(prev.G), G);
+                }
+            }
         }
 
         // --- collect NEW frames' points in LOCAL frame (deferred emit) ---
